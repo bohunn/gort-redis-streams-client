@@ -3,8 +3,8 @@ module github.com/bohunn/gort-redis-streams-client
 go 1.24
 
 require (
+	github.com/bohunn/gort-trade-model v1.0.2
 	github.com/redis/go-redis/v9 v9.6.1
-	github.com/bohunn/gort-trade-model v1.0.1
 )
 
 require (
