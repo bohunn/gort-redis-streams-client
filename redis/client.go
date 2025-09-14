@@ -5,7 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"log"
+	"log/slog"
 	"time"
 
 	"github.com/bohunn/gort-trade-model/models"
@@ -16,6 +16,7 @@ import (
 type StreamClient struct {
 	client *redis.Client
 	ctx    context.Context
+	logger *slog.Logger
 
 	// Configuration
 	streamMaxLen    int64
@@ -41,6 +42,7 @@ func NewStreamClient(cfg Config) (*StreamClient, error) {
 	})
 
 	ctx := context.Background()
+	logger := slog.With("component", "redis-client")
 
 	// Test connection
 	if err := client.Ping(ctx).Err(); err != nil {
@@ -58,9 +60,16 @@ func NewStreamClient(cfg Config) (*StreamClient, error) {
 		heatmapCacheTTL = 5 * time.Minute
 	}
 
+	logger.Info("Redis client connected successfully",
+		"host", cfg.Host,
+		"port", cfg.Port,
+		"stream_max_len", streamMaxLen,
+		"heatmap_cache_ttl", heatmapCacheTTL)
+
 	return &StreamClient{
 		client:          client,
 		ctx:             ctx,
+		logger:          logger,
 		streamMaxLen:    streamMaxLen,
 		heatmapCacheTTL: heatmapCacheTTL,
 	}, nil
@@ -68,7 +77,18 @@ func NewStreamClient(cfg Config) (*StreamClient, error) {
 
 // Close closes the Redis connection
 func (s *StreamClient) Close() error {
+	s.logger.Info("Closing Redis connection")
 	return s.client.Close()
+}
+
+// Ping checks Redis connection status
+func (s *StreamClient) Ping() (bool, error) {
+	err := s.client.Ping(s.ctx).Err()
+	if err != nil {
+		s.logger.Error("Redis ping failed", "error", err)
+		return false, err
+	}
+	return true, nil
 }
 
 // ===========================================
@@ -103,20 +123,37 @@ func (s *StreamClient) PublishLiquidation(event *models.LiquidationEvent) error 
 
 	id, err := s.client.XAdd(s.ctx, args).Result()
 	if err != nil {
+		s.logger.Error("Failed to publish liquidation",
+			"stream", streamName,
+			"symbol", event.Symbol,
+			"error", err)
 		return fmt.Errorf("failed to publish liquidation: %w", err)
 	}
 
-	log.Printf("[Redis] Published liquidation to %s with ID: %s", streamName, id)
+	// Use debug level for frequent liquidation updates
+	s.logger.Debug("Published liquidation",
+		"stream", streamName,
+		"symbol", event.Symbol,
+		"side", event.Side,
+		"price", event.Price,
+		"quantity", event.Quantity,
+		"id", id)
+
 	return nil
 }
 
 // PublishLiquidationBatch publishes multiple liquidation events efficiently
 func (s *StreamClient) PublishLiquidationBatch(events []*models.LiquidationEvent) error {
+	if len(events) == 0 {
+		return nil
+	}
+
 	pipe := s.client.Pipeline()
 
+	validEvents := 0
 	for _, event := range events {
 		if err := event.Validate(); err != nil {
-			log.Printf("[Redis] Skipping invalid liquidation: %v", err)
+			s.logger.Warn("Skipping invalid liquidation in batch", "error", err)
 			continue
 		}
 
@@ -139,14 +176,22 @@ func (s *StreamClient) PublishLiquidationBatch(events []*models.LiquidationEvent
 				"order_trade_time": event.OrderTradeTime,
 			},
 		})
+		validEvents++
 	}
 
 	_, err := pipe.Exec(s.ctx)
 	if err != nil {
+		s.logger.Error("Failed to publish liquidation batch",
+			"batch_size", len(events),
+			"valid_events", validEvents,
+			"error", err)
 		return fmt.Errorf("failed to publish liquidation batch: %w", err)
 	}
 
-	log.Printf("[Redis] Published batch of %d liquidations", len(events))
+	s.logger.Info("Published liquidation batch",
+		"total_events", len(events),
+		"valid_events", validEvents)
+
 	return nil
 }
 
@@ -181,8 +226,16 @@ func (s *StreamClient) PublishMarketSnapshot(snapshot *models.MarketSnapshot) er
 
 	_, err := s.client.XAdd(s.ctx, args).Result()
 	if err != nil {
+		s.logger.Error("Failed to publish market snapshot",
+			"stream", streamName,
+			"symbol", snapshot.Symbol,
+			"error", err)
 		return fmt.Errorf("failed to publish market snapshot: %w", err)
 	}
+
+	s.logger.Debug("Published market snapshot",
+		"symbol", snapshot.Symbol,
+		"mark_price", snapshot.MarkPrice)
 
 	return nil
 }
@@ -212,8 +265,17 @@ func (s *StreamClient) PublishOrderBook(ob *models.OrderBookSnapshot) error {
 
 	_, err := s.client.XAdd(s.ctx, args).Result()
 	if err != nil {
+		s.logger.Error("Failed to publish order book",
+			"stream", streamName,
+			"symbol", ob.Symbol,
+			"error", err)
 		return fmt.Errorf("failed to publish order book: %w", err)
 	}
+
+	s.logger.Debug("Published order book",
+		"symbol", ob.Symbol,
+		"spread", ob.Spread,
+		"mid_price", ob.MidPrice)
 
 	return nil
 }
@@ -230,12 +292,12 @@ func (s *StreamClient) CacheAndPublishHeatmap(heatmap *models.HeatmapData) error
 
 	// 1. Cache the heatmap for quick retrieval
 	if err := s.cacheHeatmap(heatmap); err != nil {
-		log.Printf("[Redis] Warning: failed to cache heatmap: %v", err)
+		s.logger.Warn("Failed to cache heatmap", "symbol", heatmap.Symbol, "error", err)
 	}
 
 	// 2. Publish to heatmap stream for real-time subscribers
 	if err := s.publishHeatmapToStream(heatmap); err != nil {
-		log.Printf("[Redis] Warning: failed to publish heatmap to stream: %v", err)
+		s.logger.Warn("Failed to publish heatmap to stream", "symbol", heatmap.Symbol, "error", err)
 	}
 
 	return nil
@@ -263,16 +325,19 @@ func (s *StreamClient) cacheHeatmap(heatmap *models.HeatmapData) error {
 		return fmt.Errorf("failed to cache heatmap: %w", err)
 	}
 
-	log.Printf("[Redis] Cached heatmap for %s:%s (TTL: %v)", heatmap.Symbol, interval, ttl)
+	s.logger.Debug("Cached heatmap",
+		"symbol", heatmap.Symbol,
+		"interval", interval,
+		"ttl", ttl,
+		"levels_count", len(heatmap.Levels),
+		"clusters_count", len(heatmap.Clusters))
+
 	return nil
 }
 
 // publishHeatmapToStream publishes heatmap to stream for real-time subscribers
 func (s *StreamClient) publishHeatmapToStream(heatmap *models.HeatmapData) error {
 	streamName := models.GetHeatmapStreamName(heatmap.Symbol)
-
-	// For stream, we'll store a lighter version with reference to cache
-	// This prevents stream bloat while maintaining real-time updates
 
 	// Serialize only essential data for stream
 	summary, _ := json.Marshal(heatmap.Summary)
@@ -299,7 +364,14 @@ func (s *StreamClient) publishHeatmapToStream(heatmap *models.HeatmapData) error
 		return fmt.Errorf("failed to publish heatmap to stream: %w", err)
 	}
 
-	log.Printf("[Redis] Published heatmap update to %s with ID: %s", streamName, id)
+	// Use debug level for frequent heatmap updates
+	s.logger.Debug("Published heatmap update",
+		"stream", streamName,
+		"symbol", heatmap.Symbol,
+		"levels_count", len(heatmap.Levels),
+		"clusters_count", len(heatmap.Clusters),
+		"id", id)
+
 	return nil
 }
 
@@ -310,6 +382,7 @@ func (s *StreamClient) GetCachedHeatmap(symbol models.Symbol, interval models.In
 	data, err := s.client.Get(s.ctx, key).Result()
 	if err != nil {
 		if err == redis.Nil {
+			s.logger.Debug("Cache miss for heatmap", "symbol", symbol, "interval", interval)
 			return nil, nil // Cache miss
 		}
 		return nil, fmt.Errorf("failed to get cached heatmap: %w", err)
@@ -320,6 +393,7 @@ func (s *StreamClient) GetCachedHeatmap(symbol models.Symbol, interval models.In
 		return nil, fmt.Errorf("failed to unmarshal heatmap: %w", err)
 	}
 
+	s.logger.Debug("Retrieved cached heatmap", "symbol", symbol, "interval", interval)
 	return &heatmap, nil
 }
 
@@ -330,7 +404,7 @@ func (s *StreamClient) GetLatestHeatmaps(symbols []models.Symbol, interval model
 	for _, symbol := range symbols {
 		heatmap, err := s.GetCachedHeatmap(symbol, interval)
 		if err != nil {
-			log.Printf("[Redis] Failed to get heatmap for %s: %v", symbol, err)
+			s.logger.Error("Failed to get heatmap", "symbol", symbol, "error", err)
 			continue
 		}
 		if heatmap != nil {
@@ -338,17 +412,16 @@ func (s *StreamClient) GetLatestHeatmaps(symbols []models.Symbol, interval model
 		}
 	}
 
+	s.logger.Debug("Retrieved latest heatmaps", "requested", len(symbols), "found", len(result))
 	return result, nil
 }
 
 // getHeatmapTTL returns appropriate TTL for each interval
 func (s *StreamClient) getHeatmapTTL(interval models.Interval) time.Duration {
-	// Override with configured TTL if interval is 1s (real-time)
 	if interval == models.Interval1s {
 		return s.heatmapCacheTTL
 	}
 
-	// Otherwise use interval-based TTL
 	switch interval {
 	case models.Interval1m:
 		return 5 * time.Minute
@@ -383,8 +456,8 @@ type ConsumerConfig struct {
 // ConsumeHeatmapStream consumes heatmap updates from stream
 func (s *StreamClient) ConsumeHeatmapStream(symbol models.Symbol, handler func(*models.HeatmapData) error) error {
 	streamName := models.GetHeatmapStreamName(symbol)
+	s.logger.Info("Starting heatmap stream consumer", "symbol", symbol, "stream", streamName)
 
-	// Read from the stream
 	for {
 		result, err := s.client.XRead(s.ctx, &redis.XReadArgs{
 			Streams: []string{streamName, "$"}, // Read new messages only
@@ -396,7 +469,7 @@ func (s *StreamClient) ConsumeHeatmapStream(symbol models.Symbol, handler func(*
 			if err == redis.Nil {
 				continue
 			}
-			log.Printf("[Redis] Error reading heatmap stream: %v", err)
+			s.logger.Error("Error reading heatmap stream", "stream", streamName, "error", err)
 			time.Sleep(time.Second)
 			continue
 		}
@@ -405,21 +478,20 @@ func (s *StreamClient) ConsumeHeatmapStream(symbol models.Symbol, handler func(*
 			for _, msg := range stream.Messages {
 				// Get the full heatmap from cache using the cache key
 				if cacheKey, ok := msg.Values["cache_key"].(string); ok {
-					// Extract symbol and interval from cache key
 					data, err := s.client.Get(s.ctx, cacheKey).Result()
 					if err != nil {
-						log.Printf("[Redis] Failed to get heatmap from cache: %v", err)
+						s.logger.Error("Failed to get heatmap from cache", "cache_key", cacheKey, "error", err)
 						continue
 					}
 
 					var heatmap models.HeatmapData
 					if err := json.Unmarshal([]byte(data), &heatmap); err != nil {
-						log.Printf("[Redis] Failed to unmarshal heatmap: %v", err)
+						s.logger.Error("Failed to unmarshal heatmap", "error", err)
 						continue
 					}
 
 					if err := handler(&heatmap); err != nil {
-						log.Printf("[Redis] Handler error: %v", err)
+						s.logger.Error("Heatmap handler error", "error", err)
 					}
 				}
 			}
@@ -433,7 +505,7 @@ func (s *StreamClient) ConsumeLiquidationStream(cfg ConsumerConfig, handler func
 	for _, stream := range cfg.Streams {
 		err := s.client.XGroupCreateMkStream(s.ctx, stream, cfg.Group, "$").Err()
 		if err != nil && err.Error() != "BUSYGROUP Consumer Group name already exists" {
-			log.Printf("[Redis] Warning: failed to create consumer group for %s: %v", stream, err)
+			s.logger.Warn("Failed to create consumer group", "stream", stream, "group", cfg.Group, "error", err)
 		}
 	}
 
@@ -446,10 +518,12 @@ func (s *StreamClient) ConsumeLiquidationStream(cfg ConsumerConfig, handler func
 		streamArgs = append(streamArgs, ">") // Read new messages
 	}
 
-	log.Printf("[Redis] Starting consumer %s in group %s for streams: %v", cfg.Consumer, cfg.Group, cfg.Streams)
+	s.logger.Info("Starting liquidation stream consumer",
+		"consumer", cfg.Consumer,
+		"group", cfg.Group,
+		"streams", cfg.Streams)
 
 	for {
-		// Read from streams
 		args := &redis.XReadGroupArgs{
 			Group:    cfg.Group,
 			Consumer: cfg.Consumer,
@@ -464,7 +538,7 @@ func (s *StreamClient) ConsumeLiquidationStream(cfg ConsumerConfig, handler func
 			if err == redis.Nil {
 				continue // No new messages
 			}
-			log.Printf("[Redis] Error reading from streams: %v", err)
+			s.logger.Error("Error reading from liquidation streams", "error", err)
 			time.Sleep(time.Second)
 			continue
 		}
@@ -474,18 +548,18 @@ func (s *StreamClient) ConsumeLiquidationStream(cfg ConsumerConfig, handler func
 			for _, msg := range stream.Messages {
 				event, err := ParseLiquidationMessage(msg)
 				if err != nil {
-					log.Printf("[Redis] Failed to parse liquidation: %v", err)
+					s.logger.Error("Failed to parse liquidation message", "error", err)
 					continue
 				}
 
 				if err := handler(event); err != nil {
-					log.Printf("[Redis] Handler error: %v", err)
+					s.logger.Error("Liquidation handler error", "error", err)
 					continue
 				}
 
 				// ACK the message
 				if err := s.client.XAck(s.ctx, stream.Stream, cfg.Group, msg.ID).Err(); err != nil {
-					log.Printf("[Redis] Error ACKing message %s: %v", msg.ID, err)
+					s.logger.Error("Error ACKing message", "stream", stream.Stream, "id", msg.ID, "error", err)
 				}
 			}
 		}
@@ -547,6 +621,7 @@ func (s *StreamClient) GetStreamLength(streamName string) (int64, error) {
 
 // TrimStream trims a stream to a maximum length
 func (s *StreamClient) TrimStream(streamName string, maxLen int64) error {
+	s.logger.Info("Trimming stream", "stream", streamName, "max_len", maxLen)
 	return s.client.XTrimMaxLen(s.ctx, streamName, maxLen).Err()
 }
 
@@ -594,5 +669,6 @@ func (s *StreamClient) GetStats() (map[string]interface{}, error) {
 		}
 	}
 
+	s.logger.Debug("Generated Redis statistics", "stats_count", len(stats))
 	return stats, nil
 }
